@@ -9,21 +9,33 @@ passive security-hygiene issues, pulls real-world Core Web Vitals from
 Google's PageSpeed Insights API, and renders a color-coded PDF report with a
 "Fix These First" quick-wins page and an Impact x Effort matrix.
 
-Usage:
-    python audit.py <url> [output.pdf]
+Two modes:
 
-The URL is required - there is no default site. The report is written to
-site_audit_report_<domain>_<YYYY-MM-DD>.pdf unless an explicit output path
-is given, so re-running for a client never overwrites a report you already
-sent.
+    report  Deep single-site audit - crawl, PageSpeed, PDF report.
+            python audit.py report --url https://example.com [--out PATH]
+
+    screen  Fast triage across many sites - homepage only, no crawl, no PDF.
+            Writes one CSV row per business, ranked by finding count, for
+            cold outreach prioritization.
+            python audit.py screen --csv prospects.csv [--out results.csv] [--psi]
+            python audit.py screen --url https://example.com
+
+A URL is always required - there is no default site. Reports are written to
+site_audit_report_<domain>_<YYYY-MM-DD>.pdf unless an explicit output path is
+given, so re-running for a client never overwrites a report already sent.
 
 Environment variables:
     PAGESPEED_API_KEY - optional. Without one, PageSpeed Insights runs on
         Google's free unauthenticated tier, which is heavily rate-limited.
         Register a free key at:
         https://developers.google.com/speed/docs/insights/v5/get-started
+    PLACES_API_KEY - optional, for screen mode's website lookup of businesses
+        with a blank website column. Falls back to PAGESPEED_API_KEY. Billed
+        per request, so lookups are cached and capped by --max-lookups.
 """
 
+import argparse
+import csv
 import hashlib
 import json
 import logging
@@ -58,6 +70,22 @@ MAX_IMAGE_CHECKS_PER_PAGE = 4  # cap on per-page image size checks
 OUTPUT_PDF_TEMPLATE = "site_audit_report_{domain}_{date}.pdf"
                                  # per-domain and dated, so re-auditing a client
                                  # never silently overwrites a report already sent
+
+# Screen mode (fast multi-site triage)
+SCREEN_TIMEOUT = 10            # per-request cap, keeps the per-site budget under 10s
+MAX_PLACES_LOOKUPS = 250       # guardrail: Places Text Search is billed per request
+PLACES_CACHE_FILE = "places_cache.json"
+PLACES_CACHE_TTL_SECONDS = 60 * 60 * 24 * 30  # 30 days
+PLACES_API_URL = "https://places.googleapis.com/v1/places:searchText"
+PLACES_API_KEY = (os.environ.get("PLACES_API_KEY", "").strip()
+                   or os.environ.get("PAGESPEED_API_KEY", "").strip())
+SCREEN_CSV_COLUMNS = [
+    "name", "website", "platform", "page_builder", "findings_count", "findings",
+    "psi_mobile_score", "psi_mobile_lcp", "error",
+    # blank columns filled in by hand during outreach
+    "contacted", "channel", "replied", "call_booked", "closed", "objection",
+]
+SCREEN_MANUAL_COLUMNS = ["contacted", "channel", "replied", "call_booked", "closed", "objection"]
 STATE_FILE_TEMPLATE = "audit_state_{domain}.pkl"
                                  # checkpoint of crawl_data + auto-detected issues,
                                  # so the PDF can be rebuilt (e.g. to add manual
@@ -2059,34 +2087,86 @@ def add_manual_findings(issues, base_url):
 # Main
 # --------------------------------------------------------------------------
 
-USAGE = """usage: python audit.py <url> [output.pdf]
-
-  <url>         Site to audit, e.g. https://example.com (required)
-  [output.pdf]  Optional report path. Defaults to
-                site_audit_report_<domain>_<YYYY-MM-DD>.pdf
-"""
-
-
-def parse_args(argv):
-    """Return (base_url, output_override). Exits with usage on bad input."""
-    args = [a for a in argv[1:] if not a.startswith("-")]
-    if len(argv) > 1 and argv[1] in ("-h", "--help"):
-        print(USAGE, end="")
-        sys.exit(0)
-    if not args:
-        sys.stderr.write("error: a URL to audit is required.\n\n" + USAGE)
-        sys.exit(2)
-    base_url = args[0]
-    parsed = urlparse(base_url)
+def valid_url(value):
+    """argparse type: accept only well-formed http(s) URLs."""
+    parsed = urlparse(value)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        sys.stderr.write(f"error: '{base_url}' is not a valid http(s) URL.\n\n" + USAGE)
-        sys.exit(2)
-    return base_url, (args[1] if len(args) > 1 else None)
+        raise argparse.ArgumentTypeError(f"'{value}' is not a valid http(s) URL")
+    return value
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="audit.py",
+        description="Site audit tool: deep single-site reports, or fast multi-site triage.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="examples:\n"
+                "  python audit.py report --url https://example.com\n"
+                "  python audit.py screen --csv prospects.csv --out results.csv\n"
+                "  python audit.py screen --url https://example.com --psi\n")
+    subs = parser.add_subparsers(dest="command", metavar="{report,screen}")
+
+    def add_shared(sp):
+        sp.add_argument("--rate-limit", type=float, default=RATE_LIMIT_SECONDS, metavar="SECONDS",
+                         help=f"seconds between requests (default: {RATE_LIMIT_SECONDS})")
+
+    rp = subs.add_parser("report", help="full crawl + PDF report for one site")
+    rp.add_argument("--url", required=True, type=valid_url, help="site to audit (required)")
+    rp.add_argument("--out", metavar="PATH",
+                     help="report path (default: site_audit_report_<domain>_<date>.pdf)")
+    rp.add_argument("--max-pages", type=int, default=MAX_PAGES, metavar="N",
+                     help=f"maximum pages to crawl (default: {MAX_PAGES})")
+    rp.add_argument("--max-link-checks", type=int, default=MAX_LINK_CHECKS, metavar="N",
+                     help=f"cap on broken-link checks (default: {MAX_LINK_CHECKS})")
+    add_shared(rp)
+
+    sp = subs.add_parser("screen", help="fast homepage-only triage across many sites")
+    src = sp.add_mutually_exclusive_group(required=True)
+    src.add_argument("--csv", metavar="FILE",
+                      help="input CSV with columns: name, address, phone, category, tier, website")
+    src.add_argument("--url", type=valid_url, help="screen a single site")
+    sp.add_argument("--out", default="results.csv", metavar="PATH",
+                     help="output CSV path (default: results.csv)")
+    sp.add_argument("--psi", action="store_true",
+                     help="also fetch PageSpeed mobile scores (much slower)")
+    sp.add_argument("--timeout", type=float, default=SCREEN_TIMEOUT, metavar="SECONDS",
+                     help=f"per-request timeout (default: {SCREEN_TIMEOUT})")
+    sp.add_argument("--max-lookups", type=int, default=MAX_PLACES_LOOKUPS, metavar="N",
+                     help=f"cap on billable Places API lookups (default: {MAX_PLACES_LOOKUPS})")
+    add_shared(sp)
+    return parser
+
+
+def apply_global_settings(args):
+    """The tunables are module-level constants read at call time throughout the
+    pipeline, so flags are applied here once rather than threaded through every
+    function signature."""
+    global MAX_PAGES, RATE_LIMIT_SECONDS, MAX_LINK_CHECKS
+    if getattr(args, "max_pages", None) is not None:
+        MAX_PAGES = args.max_pages
+    if getattr(args, "max_link_checks", None) is not None:
+        MAX_LINK_CHECKS = args.max_link_checks
+    if getattr(args, "rate_limit", None) is not None:
+        RATE_LIMIT_SECONDS = args.rate_limit
+        limiter.delay = args.rate_limit
 
 
 def main():
-    base_url, output_override = parse_args(sys.argv)
-    output_pdf = output_pdf_path(base_url, output_override)
+    parser = build_parser()
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_usage(sys.stderr)
+        sys.stderr.write("\nerror: a command is required (report or screen).\n")
+        sys.exit(2)
+    apply_global_settings(args)
+    if args.command == "screen":
+        return cmd_screen(args)
+    return cmd_report(args)
+
+
+def cmd_report(args):
+    base_url = args.url
+    output_pdf = output_pdf_path(base_url, args.out)
 
     crawl_data, issues = load_state(base_url)
     if crawl_data is None:
@@ -2122,6 +2202,10 @@ def main():
 
     build_pdf(crawl_data["base_url"], issues, crawl_data, output_pdf)
     print(f"\nDone. Report saved to {output_pdf}")
+
+
+def cmd_screen(args):
+    raise NotImplementedError("screen mode lands in the next commit")
 
 
 if __name__ == "__main__":
