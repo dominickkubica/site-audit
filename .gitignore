@@ -7,6 +7,9 @@ pagespeed_cache.json
 
 # Generated reports - client deliverables, not source
 *.pdf
+# ...except the delivered v3 report, which is the regression baseline every
+# verification diffs against (and the only artifact of real delivered work)
+!rvivl_audit_report_v3.pdf
 
 # Run logs
 crawl_log.txt
