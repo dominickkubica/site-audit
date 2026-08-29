@@ -1,0 +1,45 @@
+# Crawl/PSI checkpoints - per-site, regenerable, and can contain a full
+# snapshot of a client's site content
+*.pkl
+
+# PageSpeed Insights response cache (regenerable, 7-day TTL)
+pagespeed_cache.json
+
+# Generated reports - client deliverables, not source
+*.pdf
+
+# Run logs
+crawl_log.txt
+*.log
+
+# Secrets (PAGESPEED_API_KEY etc.)
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Virtualenvs
+venv/
+.venv/
+env/
+
+# Local tool/editor state
+.claude/settings.local.json
+.vscode/
+.idea/
+*.swp
+
+# OS cruft
+.DS_Store
+Thumbs.db
+desktop.ini
