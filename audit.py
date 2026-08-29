@@ -10,9 +10,12 @@ Google's PageSpeed Insights API, and renders a color-coded PDF report with a
 "Fix These First" quick-wins page and an Impact x Effort matrix.
 
 Usage:
-    python audit.py [https://example.com]
+    python audit.py <url> [output.pdf]
 
-If no URL is given, BASE_URL below is used.
+The URL is required - there is no default site. The report is written to
+site_audit_report_<domain>_<YYYY-MM-DD>.pdf unless an explicit output path
+is given, so re-running for a client never overwrites a report you already
+sent.
 
 Environment variables:
     PAGESPEED_API_KEY - optional. Without one, PageSpeed Insights runs on
@@ -47,13 +50,14 @@ from fpdf import FPDF
 # Configuration
 # --------------------------------------------------------------------------
 
-BASE_URL = "https://rvivl.co"
 MAX_PAGES = 50
 RATE_LIMIT_SECONDS = 1.0
 REQUEST_TIMEOUT = 15
 MAX_LINK_CHECKS = 150          # cap on total broken-link HEAD/GET checks
 MAX_IMAGE_CHECKS_PER_PAGE = 4  # cap on per-page image size checks
-OUTPUT_PDF = "site_audit_report.pdf"
+OUTPUT_PDF_TEMPLATE = "site_audit_report_{domain}_{date}.pdf"
+                                 # per-domain and dated, so re-auditing a client
+                                 # never silently overwrites a report already sent
 STATE_FILE_TEMPLATE = "audit_state_{domain}.pkl"
                                  # checkpoint of crawl_data + auto-detected issues,
                                  # so the PDF can be rebuilt (e.g. to add manual
@@ -1918,6 +1922,14 @@ def state_file_path(base_url):
     return STATE_FILE_TEMPLATE.format(domain=domain_key(base_url))
 
 
+def output_pdf_path(base_url, override=None):
+    """Report filename for this site and date, or override verbatim if given."""
+    if override:
+        return override
+    return OUTPUT_PDF_TEMPLATE.format(domain=domain_key(base_url),
+                                       date=datetime.now().strftime("%Y-%m-%d"))
+
+
 def save_state(crawl_data, issues):
     base_url = crawl_data["base_url"]
     path = state_file_path(base_url)
@@ -2047,8 +2059,34 @@ def add_manual_findings(issues, base_url):
 # Main
 # --------------------------------------------------------------------------
 
+USAGE = """usage: python audit.py <url> [output.pdf]
+
+  <url>         Site to audit, e.g. https://example.com (required)
+  [output.pdf]  Optional report path. Defaults to
+                site_audit_report_<domain>_<YYYY-MM-DD>.pdf
+"""
+
+
+def parse_args(argv):
+    """Return (base_url, output_override). Exits with usage on bad input."""
+    args = [a for a in argv[1:] if not a.startswith("-")]
+    if len(argv) > 1 and argv[1] in ("-h", "--help"):
+        print(USAGE, end="")
+        sys.exit(0)
+    if not args:
+        sys.stderr.write("error: a URL to audit is required.\n\n" + USAGE)
+        sys.exit(2)
+    base_url = args[0]
+    parsed = urlparse(base_url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        sys.stderr.write(f"error: '{base_url}' is not a valid http(s) URL.\n\n" + USAGE)
+        sys.exit(2)
+    return base_url, (args[1] if len(args) > 1 else None)
+
+
 def main():
-    base_url = sys.argv[1] if len(sys.argv) > 1 else BASE_URL
+    base_url, output_override = parse_args(sys.argv)
+    output_pdf = output_pdf_path(base_url, output_override)
 
     crawl_data, issues = load_state(base_url)
     if crawl_data is None:
@@ -2082,8 +2120,8 @@ def main():
 
     add_manual_findings(issues, crawl_data["base_url"])
 
-    build_pdf(crawl_data["base_url"], issues, crawl_data, OUTPUT_PDF)
-    print(f"\nDone. Report saved to {OUTPUT_PDF}")
+    build_pdf(crawl_data["base_url"], issues, crawl_data, output_pdf)
+    print(f"\nDone. Report saved to {output_pdf}")
 
 
 if __name__ == "__main__":
