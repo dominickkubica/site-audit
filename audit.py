@@ -54,9 +54,13 @@ REQUEST_TIMEOUT = 15
 MAX_LINK_CHECKS = 150          # cap on total broken-link HEAD/GET checks
 MAX_IMAGE_CHECKS_PER_PAGE = 4  # cap on per-page image size checks
 OUTPUT_PDF = "site_audit_report.pdf"
-STATE_FILE = "audit_state.pkl"  # checkpoint of crawl_data + auto-detected issues,
+STATE_FILE_TEMPLATE = "audit_state_{domain}.pkl"
+                                 # checkpoint of crawl_data + auto-detected issues,
                                  # so the PDF can be rebuilt (e.g. to add manual
-                                 # findings) without re-crawling or re-hitting PSI
+                                 # findings) without re-crawling or re-hitting PSI.
+                                 # Named per-domain, and the audited base_url is
+                                 # stored inside and re-checked on load, so a
+                                 # checkpoint can never be applied to another site.
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SiteAuditBot/1.0 "
     "(+https://github.com/; automated site health audit)"
@@ -258,6 +262,15 @@ def same_domain(url, base_netloc):
         return urlparse(url).netloc.replace("www.", "") == base_netloc.replace("www.", "")
     except ValueError:
         return False
+
+
+def domain_key(url):
+    """Stable per-site key used to name state checkpoints and to look up
+    manual findings - the netloc, www-insensitive and lowercased, matching
+    same_domain() above. Keeps one site's cached crawl and hand-written
+    findings from ever being applied to another site."""
+    key = urlparse(url).netloc.replace("www.", "").lower()
+    return re.sub(r"[^a-z0-9.\-]", "_", key)
 
 
 SKIP_EXTENSIONS = (
@@ -1482,65 +1495,59 @@ def draw_title_page(pdf, site_url, generated_at, pages_crawled):
                     align="C", new_x="LMARGIN", new_y="NEXT")
 
 
-def draw_narrative_intro(pdf):
+def draw_narrative_intro(pdf, narrative):
     """A standalone editorial-brief page - deliberately styled unlike the
     findings pages (no severity badge, no issue-card layout) so it reads as
-    prose to skim first, not another entry in the list."""
+    prose to skim first, not another entry in the list.
+
+    The copy is hand-written per site and read from the "narrative" key of
+    manual_findings/<domain>.json. Sites without one skip this page entirely:
+    nothing is drawn and no page is started, so pagination and the footer's
+    page numbering simply close up around it."""
+    if not narrative:
+        return
+
+    heading = narrative.get("heading")
+    paragraphs = [p for p in narrative.get("paragraphs", []) if p]
+    footnote = narrative.get("footnote")
+    closing = narrative.get("closing")
+    if not (heading or paragraphs or footnote or closing):
+        return
+
     pdf.add_page()
     pdf.set_y(22)
 
-    pdf.set_font("Helvetica", "B", 20)
-    pdf.set_text_color(198, 40, 40)
-    pdf.multi_cell(0, 9.5, sanitize("Highlighting performance on Mobile & Desktop"),
-                    new_x="LMARGIN", new_y="NEXT", align="L")
+    if heading:
+        pdf.set_font("Helvetica", "B", 20)
+        pdf.set_text_color(198, 40, 40)
+        pdf.multi_cell(0, 9.5, sanitize(heading),
+                        new_x="LMARGIN", new_y="NEXT", align="L")
 
-    pdf.set_draw_color(198, 40, 40)
-    pdf.set_line_width(0.8)
-    pdf.line(10, pdf.get_y() + 1, 70, pdf.get_y() + 1)
-    pdf.set_line_width(0.2)
-    pdf.ln(9)
+        pdf.set_draw_color(198, 40, 40)
+        pdf.set_line_width(0.8)
+        pdf.line(10, pdf.get_y() + 1, 70, pdf.get_y() + 1)
+        pdf.set_line_width(0.2)
+        pdf.ln(9)
 
     pdf.set_font("Helvetica", "", 11.5)
     pdf.set_text_color(30, 30, 30)
 
-    paragraphs = [
-        "Google's PageSpeed Insights, run directly against rvivl.co on July 16, 2026, scored the homepage's "
-        "mobile experience between 42 and 52 out of 100 across repeated tests - squarely in the range Google "
-        "itself labels \"poor.\" Desktop, tested the same way at the same time, scored a reasonable 67/100. "
-        "This is not general slowness. It is a mobile-specific failure on the device most visitors actually "
-        "use to find and book a local wellness studio.",
-
-        "The clearest single number: Largest Contentful Paint (how long visitors wait to see the main "
-        "content) ranged from 15.4 seconds to 51.1 seconds on mobile, against Google's \"poor\" threshold of "
-        "just 4 seconds and desktop's own 2.9-3.1 seconds. Even the best mobile result recorded is roughly 4x "
-        "slower than Google's cutoff for acceptable. The worst result is over 10x slower than desktop on the "
-        "exact same page.",
-
-        "The root cause is visible in the data: mobile testing found up to 79 render-blocking CSS and "
-        "JavaScript files loading sequentially before any content can render - a direct symptom of Elementor "
-        "plugin bloat accumulated over time, not a hosting or bandwidth problem. This is confirmed "
-        "independently by this report's own crawl, which found the homepage loading 77 separate <script> tags.",
-    ]
     for p in paragraphs:
         pdf.multi_cell(0, 6.3, sanitize(p), new_x="LMARGIN", new_y="NEXT", align="L")
         pdf.ln(4)
 
-    pdf.set_font("Helvetica", "I", 9.5)
-    pdf.set_text_color(90, 90, 90)
-    pdf.multi_cell(0, 5.5,
-                    sanitize("Full PageSpeed Insights reports (mobile and desktop, tested live): "
-                             "pagespeed.web.dev/analysis/https-rvivl-co"),
-                    new_x="LMARGIN", new_y="NEXT", align="L")
-    pdf.ln(6)
+    if footnote:
+        pdf.set_font("Helvetica", "I", 9.5)
+        pdf.set_text_color(90, 90, 90)
+        pdf.multi_cell(0, 5.5, sanitize(footnote),
+                        new_x="LMARGIN", new_y="NEXT", align="L")
+        pdf.ln(6)
 
-    pdf.set_font("Helvetica", "", 11.5)
-    pdf.set_text_color(30, 30, 30)
-    pdf.multi_cell(0, 6.3,
-                    sanitize("If this were an isolated page, it would be a minor note. It isn't - every page "
-                             "tested scored in the same \"poor-to-needs-improvement\" mobile band. This is a "
-                             "site-wide pattern, and it is actively costing bookings from mobile visitors "
-                             "before they see a single service or price."),
-                    new_x="LMARGIN", new_y="NEXT", align="L")
+    if closing:
+        pdf.set_font("Helvetica", "", 11.5)
+        pdf.set_text_color(30, 30, 30)
+        pdf.multi_cell(0, 6.3, sanitize(closing),
+                        new_x="LMARGIN", new_y="NEXT", align="L")
 
 
 def draw_quick_wins(pdf, quick_wins, hours_range):
@@ -1884,7 +1891,7 @@ def build_pdf(site_url, issues, crawl_data, output_path):
     pages_crawled = len(crawl_data["pages"])
     draw_title_page(pdf, site_url, generated_at, pages_crawled)
 
-    draw_narrative_intro(pdf)
+    draw_narrative_intro(pdf, load_manual_data(site_url).get("narrative"))
 
     quick_wins = select_quick_wins(issues)
     hours_range = estimate_total_hours(issues)
@@ -1906,21 +1913,47 @@ def build_pdf(site_url, issues, crawl_data, output_path):
 # without re-crawling the site or re-hitting the PageSpeed API)
 # --------------------------------------------------------------------------
 
+def state_file_path(base_url):
+    """Checkpoint filename for this specific site."""
+    return STATE_FILE_TEMPLATE.format(domain=domain_key(base_url))
+
+
 def save_state(crawl_data, issues):
+    base_url = crawl_data["base_url"]
+    path = state_file_path(base_url)
     try:
-        with open(STATE_FILE, "wb") as f:
-            pickle.dump({"crawl_data": crawl_data, "issues": issues}, f)
+        with open(path, "wb") as f:
+            pickle.dump({"base_url": base_url, "crawl_data": crawl_data, "issues": issues}, f)
     except (OSError, pickle.PickleError) as exc:
         log.warning("Could not write state checkpoint: %s", exc)
 
 
-def load_state():
-    if not os.path.exists(STATE_FILE):
+def load_state(base_url):
+    """Load the checkpoint for base_url, or (None, None) to force a fresh run.
+
+    The checkpoint is only reused when the base_url stored inside it matches
+    the site being audited. A mismatched or unlabelled checkpoint is ignored
+    with a warning rather than silently producing a report about the wrong
+    business."""
+    path = state_file_path(base_url)
+    if not os.path.exists(path):
         return None, None
     try:
-        with open(STATE_FILE, "rb") as f:
+        with open(path, "rb") as f:
             data = pickle.load(f)
-        return data.get("crawl_data"), data.get("issues")
+        stored_url = data.get("base_url")
+        crawl_data = data.get("crawl_data")
+        if stored_url is None and isinstance(crawl_data, dict):
+            stored_url = crawl_data.get("base_url")
+        if not stored_url:
+            log.warning("Checkpoint %s does not record which site it is for - ignoring it and "
+                        "running the full pipeline fresh.", path)
+            return None, None
+        if normalize_url(stored_url) != normalize_url(base_url):
+            log.warning("Checkpoint %s was built for %s but this run audits %s - ignoring the "
+                        "checkpoint and running the full pipeline fresh.", path, stored_url, base_url)
+            return None, None
+        return crawl_data, data.get("issues")
     except (OSError, pickle.PickleError, EOFError, AttributeError) as exc:
         log.warning("Could not load state checkpoint (%s) - will rebuild from scratch", exc)
         return None, None
@@ -1931,67 +1964,83 @@ def load_state():
 #
 # Confirmed by hand via Google's PageSpeed Insights web UI (pagespeed.web.dev)
 # rather than pulled automatically by this script's PSI integration above -
-# added here as regular Issue entries so they sort, group, and appear in the
+# added as regular Issue entries so they sort, group, and appear in the
 # quick-wins/matrix exactly like every auto-detected finding.
+#
+# Stored per-site in manual_findings/<domain>.json (paths in "pages" are
+# relative to the base URL; "" means the base URL itself). A site with no
+# file for its domain gets no manual findings at all.
 # --------------------------------------------------------------------------
 
+MANUAL_FINDINGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "manual_findings")
+
+
+def manual_findings_path(base_url):
+    """Path to the per-site manual findings file for base_url."""
+    return os.path.join(MANUAL_FINDINGS_DIR, f"{domain_key(base_url)}.json")
+
+
+def load_manual_data(base_url):
+    """Read manual_findings/<domain>.json, or return {} if there is nothing
+    usable for this site.
+
+    Accepts either a bare JSON list (findings only) or an object with
+    "findings" and/or "narrative" keys. A missing file is normal and silent;
+    an unreadable or malformed one logs a warning and is skipped."""
+    path = manual_findings_path(base_url)
+    if not os.path.exists(path):
+        return {}
+
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, list):
+            data = {"findings": data}
+        if not isinstance(data, dict):
+            raise ValueError("expected a JSON object or list")
+        findings = data.get("findings", [])
+        if not isinstance(findings, list):
+            raise ValueError("'findings' must be a list")
+        data["findings"] = findings
+        return data
+    except (OSError, ValueError) as exc:  # ValueError covers JSONDecodeError
+        log.warning("Skipping manual content - could not read %s: %s", path, exc)
+        return {}
+
+
 def add_manual_findings(issues, base_url):
-    add_issue(issues, "Performance", "Severe mobile/desktop performance gap", "High", "Involved",
-               "Desktop scores 67/100 with a 2.9s LCP - reasonable. Mobile scores only 52/100 with a 51.1s "
-               "LCP. Since most visitors to a local wellness studio browse and book from their phone, this "
-               "isn't general slowness, it's a mobile-specific crisis that's likely costing bookings.",
-               ["Address render-blocking CSS/JS specifically on mobile (79 blocking requests were found "
-                "taking ~22s combined on mobile vs ~2.2s on desktop under less aggressive network throttling).",
-                "Prioritize deferring/inlining critical CSS.",
-                "Re-test mobile specifically after each fix since desktop is already acceptable."],
-               page_url=base_url)
+    """Add hand-confirmed findings for this specific site, if any exist.
 
-    add_issue(issues, "Performance", "Very large total page weight (17.9MB on desktop)", "High", "Involved",
-               "Total network payload (all images, scripts, fonts, video) is 17.9MB, far above the ~1-3MB "
-               "guideline for a fast-loading marketing page. This is measured by Google's own PageSpeed "
-               "tool, not just our crawler's HTML size check.",
-               ["Compress/resize the largest images and the background video.",
-                "Audit for any unused plugin assets loading on every page.",
-                "Consider lazy-loading or removing the autoplay background video entirely on mobile."],
-               page_url=base_url)
+    Findings live in manual_findings/<domain>.json so they never leak across
+    sites; a site with no file simply gets no manual findings."""
+    path = manual_findings_path(base_url)
+    findings = load_manual_data(base_url).get("findings", [])
 
-    add_issue(issues, "Structure", "Broken hero background video", "High", "Quick",
-               "The homepage's background video (RVIVL-Elevated-Fitness-Recovery....mp4) fails to load with "
-               "a connection error on both mobile and desktop. Visitors currently see a broken/blank hero "
-               "section instead of the intended video.",
-               ["Re-upload the video file and verify the URL/path is correct.",
-                "Confirm hosting/CDN isn't blocking large media files.",
-                "Test the fix on both mobile and desktop."],
-               page_url=base_url)
+    loaded = 0
+    for idx, finding in enumerate(findings):
+        try:
+            category = finding["category"]
+            issue_text = finding["issue"]
+            severity = finding["severity"]
+            effort = finding["effort"]
+            why = finding["why"]
+            solutions = list(finding["solutions"])
+            page_detail = finding.get("page_detail")
+            pages = finding.get("pages", [""])
+            if not isinstance(pages, list):
+                raise TypeError("'pages' must be a list")
+        except (TypeError, KeyError, AttributeError) as exc:
+            log.warning("Skipping malformed manual finding #%d in %s: %s", idx + 1, path, exc)
+            continue
 
-    add_issue(issues, "Performance", "Broken/404 image asset", "Medium", "Quick",
-               "One image (a cropped brandmark thumbnail) returns a 404 error on page load, wasting a "
-               "request and potentially leaving a broken image icon.",
-               ["Re-upload the missing image or remove the reference to it from the page/theme."],
-               page_url=base_url)
+        for page_path in pages:
+            page_url = f"{base_url.rstrip('/')}{page_path}" if page_path else base_url
+            add_issue(issues, category, issue_text, severity, effort, why, solutions,
+                       page_url=page_url, page_detail=page_detail)
+        loaded += 1
 
-    add_issue(issues, "Security", "Mixed content blocks web fonts from loading", "Medium", "Quick",
-               "The site loads Montserrat and Raleway font files over insecure http:// on an https:// page. "
-               "Browsers silently block these (20+ blocked requests observed), meaning visitors likely see "
-               "fallback system fonts instead of the intended brand typography - a silent brand-consistency "
-               "bug with no visible error.",
-               ["Find the hardcoded http:// font references (likely in an Elementor Google Fonts cache) and update to https://.",
-                "Clear/regenerate any font-caching plugin data after fixing."],
-               page_url=base_url, page_detail="likely site-wide, since fonts are loaded from the theme")
-
-    contrast_therapy_url = f"{base_url.rstrip('/')}/contrast-therapy-2-2"
-    for pg in (base_url, contrast_therapy_url):
-        add_issue(issues, "SEO", "Non-descriptive link text", "Low", "Quick",
-                   "A 'Learn More' link has no surrounding context for search engines or screen reader "
-                   "users to understand its destination.",
-                   ["Change link text to be descriptive on its own, e.g. 'Learn more about Contrast Therapy'."],
-                   page_url=pg)
-
-    add_issue(issues, "Accessibility", "Heading hierarchy skips levels", "Low", "Quick",
-               "A 'From Our Clients' section uses an H6 with no intervening heading levels, which breaks "
-               "the semantic outline screen reader users rely on to navigate.",
-               ["Change the heading to the correct sequential level (likely H2 or H3 depending on the page outline)."],
-               page_url=base_url)
+    if loaded:
+        log.info("Loaded %d manual finding(s) from %s", loaded, os.path.basename(path))
 
 
 # --------------------------------------------------------------------------
@@ -2001,11 +2050,11 @@ def add_manual_findings(issues, base_url):
 def main():
     base_url = sys.argv[1] if len(sys.argv) > 1 else BASE_URL
 
-    crawl_data, issues = load_state()
+    crawl_data, issues = load_state(base_url)
     if crawl_data is None:
-        log.info("No checkpoint found at %s - running the full pipeline once to build one "
+        log.info("No usable checkpoint at %s - running the full pipeline once to build one "
                   "(PageSpeed calls reuse the 7-day cache, so no new API calls happen for pages/strategies "
-                  "already fetched).", STATE_FILE)
+                  "already fetched).", state_file_path(base_url))
         log.info("Starting audit of %s (max %d pages, %.1fs between requests)",
                   base_url, MAX_PAGES, RATE_LIMIT_SECONDS)
 
@@ -2028,8 +2077,8 @@ def main():
 
         save_state(crawl_data, issues)
     else:
-        log.info("Loaded cached crawl/issue data from %s - skipping crawl, link/image checks, and "
-                  "PageSpeed calls entirely.", STATE_FILE)
+        log.info("Loaded cached crawl/issue data for %s from %s - skipping crawl, link/image checks, "
+                  "and PageSpeed calls entirely.", crawl_data["base_url"], state_file_path(base_url))
 
     add_manual_findings(issues, crawl_data["base_url"])
 

@@ -1,0 +1,99 @@
+{
+  "narrative": {
+    "heading": "Highlighting performance on Mobile & Desktop",
+    "paragraphs": [
+      "Google's PageSpeed Insights, run directly against rvivl.co on July 16, 2026, scored the homepage's mobile experience between 42 and 52 out of 100 across repeated tests - squarely in the range Google itself labels \"poor.\" Desktop, tested the same way at the same time, scored a reasonable 67/100. This is not general slowness. It is a mobile-specific failure on the device most visitors actually use to find and book a local wellness studio.",
+      "The clearest single number: Largest Contentful Paint (how long visitors wait to see the main content) ranged from 15.4 seconds to 51.1 seconds on mobile, against Google's \"poor\" threshold of just 4 seconds and desktop's own 2.9-3.1 seconds. Even the best mobile result recorded is roughly 4x slower than Google's cutoff for acceptable. The worst result is over 10x slower than desktop on the exact same page.",
+      "The root cause is visible in the data: mobile testing found up to 79 render-blocking CSS and JavaScript files loading sequentially before any content can render - a direct symptom of Elementor plugin bloat accumulated over time, not a hosting or bandwidth problem. This is confirmed independently by this report's own crawl, which found the homepage loading 77 separate <script> tags."
+    ],
+    "footnote": "Full PageSpeed Insights reports (mobile and desktop, tested live): pagespeed.web.dev/analysis/https-rvivl-co",
+    "closing": "If this were an isolated page, it would be a minor note. It isn't - every page tested scored in the same \"poor-to-needs-improvement\" mobile band. This is a site-wide pattern, and it is actively costing bookings from mobile visitors before they see a single service or price."
+  },
+  "findings": [
+  {
+    "category": "Performance",
+    "issue": "Severe mobile/desktop performance gap",
+    "severity": "High",
+    "effort": "Involved",
+    "why": "Desktop scores 67/100 with a 2.9s LCP - reasonable. Mobile scores only 52/100 with a 51.1s LCP. Since most visitors to a local wellness studio browse and book from their phone, this isn't general slowness, it's a mobile-specific crisis that's likely costing bookings.",
+    "solutions": [
+      "Address render-blocking CSS/JS specifically on mobile (79 blocking requests were found taking ~22s combined on mobile vs ~2.2s on desktop under less aggressive network throttling).",
+      "Prioritize deferring/inlining critical CSS.",
+      "Re-test mobile specifically after each fix since desktop is already acceptable."
+    ],
+    "pages": [""]
+  },
+  {
+    "category": "Performance",
+    "issue": "Very large total page weight (17.9MB on desktop)",
+    "severity": "High",
+    "effort": "Involved",
+    "why": "Total network payload (all images, scripts, fonts, video) is 17.9MB, far above the ~1-3MB guideline for a fast-loading marketing page. This is measured by Google's own PageSpeed tool, not just our crawler's HTML size check.",
+    "solutions": [
+      "Compress/resize the largest images and the background video.",
+      "Audit for any unused plugin assets loading on every page.",
+      "Consider lazy-loading or removing the autoplay background video entirely on mobile."
+    ],
+    "pages": [""]
+  },
+  {
+    "category": "Structure",
+    "issue": "Broken hero background video",
+    "severity": "High",
+    "effort": "Quick",
+    "why": "The homepage's background video (RVIVL-Elevated-Fitness-Recovery....mp4) fails to load with a connection error on both mobile and desktop. Visitors currently see a broken/blank hero section instead of the intended video.",
+    "solutions": [
+      "Re-upload the video file and verify the URL/path is correct.",
+      "Confirm hosting/CDN isn't blocking large media files.",
+      "Test the fix on both mobile and desktop."
+    ],
+    "pages": [""]
+  },
+  {
+    "category": "Performance",
+    "issue": "Broken/404 image asset",
+    "severity": "Medium",
+    "effort": "Quick",
+    "why": "One image (a cropped brandmark thumbnail) returns a 404 error on page load, wasting a request and potentially leaving a broken image icon.",
+    "solutions": [
+      "Re-upload the missing image or remove the reference to it from the page/theme."
+    ],
+    "pages": [""]
+  },
+  {
+    "category": "Security",
+    "issue": "Mixed content blocks web fonts from loading",
+    "severity": "Medium",
+    "effort": "Quick",
+    "why": "The site loads Montserrat and Raleway font files over insecure http:// on an https:// page. Browsers silently block these (20+ blocked requests observed), meaning visitors likely see fallback system fonts instead of the intended brand typography - a silent brand-consistency bug with no visible error.",
+    "solutions": [
+      "Find the hardcoded http:// font references (likely in an Elementor Google Fonts cache) and update to https://.",
+      "Clear/regenerate any font-caching plugin data after fixing."
+    ],
+    "pages": [""],
+    "page_detail": "likely site-wide, since fonts are loaded from the theme"
+  },
+  {
+    "category": "SEO",
+    "issue": "Non-descriptive link text",
+    "severity": "Low",
+    "effort": "Quick",
+    "why": "A 'Learn More' link has no surrounding context for search engines or screen reader users to understand its destination.",
+    "solutions": [
+      "Change link text to be descriptive on its own, e.g. 'Learn more about Contrast Therapy'."
+    ],
+    "pages": ["", "/contrast-therapy-2-2"]
+  },
+  {
+    "category": "Accessibility",
+    "issue": "Heading hierarchy skips levels",
+    "severity": "Low",
+    "effort": "Quick",
+    "why": "A 'From Our Clients' section uses an H6 with no intervening heading levels, which breaks the semantic outline screen reader users rely on to navigate.",
+    "solutions": [
+      "Change the heading to the correct sequential level (likely H2 or H3 depending on the page outline)."
+    ],
+    "pages": [""]
+  }
+  ]
+}
