@@ -81,8 +81,11 @@ PLACES_API_URL = "https://places.googleapis.com/v1/places:searchText"
 PLACES_API_KEY = (os.environ.get("PLACES_API_KEY", "").strip()
                    or os.environ.get("PAGESPEED_API_KEY", "").strip())
 SCREEN_CSV_COLUMNS = [
-    "name", "website", "platform", "page_builder", "findings_count", "findings",
-    "psi_mobile_score", "psi_mobile_lcp", "error",
+    # status is near the front so failures sort out without reading `error`;
+    # platform_confidence sits with the platform fields so weak detections can
+    # be filtered rather than trusted silently
+    "name", "website", "status", "platform", "page_builder", "platform_confidence",
+    "findings_count", "findings", "psi_mobile_score", "psi_mobile_lcp", "error",
     # blank columns filled in by hand during outreach
     "contacted", "channel", "replied", "call_booked", "closed", "objection",
 ]
@@ -2571,9 +2574,22 @@ def resolve_websites(rows, fieldnames, csv_path, max_lookups):
     return resolved
 
 
+def screen_status(result):
+    """Single source of truth for the status column: a row is 'ok' only if
+    nothing went wrong. Derived rather than set at each return point, so no
+    failure path can forget it."""
+    return "error" if result.get("error") else "ok"
+
+
 def screen_site(url, want_psi, timeout):
     """Triage one site from its homepage alone. Returns a result dict; never
     raises - transport and parse failures come back in the 'error' field."""
+    result = _screen_site(url, want_psi, timeout)
+    result["status"] = screen_status(result)
+    return result
+
+
+def _screen_site(url, want_psi, timeout):
     result = {c: "" for c in SCREEN_CSV_COLUMNS}
     result["website"] = url
 
@@ -2617,6 +2633,7 @@ def screen_site(url, want_psi, timeout):
     platform = detect_platform(pd, soup)
     result["platform"] = platform.platform
     result["page_builder"] = platform.page_builder
+    result["platform_confidence"] = platform.confidence
 
     if want_psi:
         cache = load_pagespeed_cache()
@@ -2696,6 +2713,9 @@ def cmd_screen(args):
         except Exception as exc:  # noqa: BLE001 - one bad host must not end a 200-site run
             result["error"] = f"unexpected failure: {type(exc).__name__}: {exc}"
             log.warning("Unexpected failure screening %s: %s", website, exc, exc_info=True)
+        # Covers the paths that never reach screen_site (no website, malformed
+        # URL, unexpected failure) as well as the ones that did.
+        result["status"] = screen_status(result)
         results.append(result)
 
     write_screen_results(args.out, results)
@@ -2721,8 +2741,8 @@ def print_screen_summary(results, out_path):
         return -(count if isinstance(count, int) else -1)
 
     ranked = sorted(results, key=sort_key)
-    ok = [r for r in results if not r.get("error")]
-    errored = [r for r in results if r.get("error")]
+    ok = [r for r in results if r.get("status") == "ok"]
+    errored = [r for r in results if r.get("status") != "ok"]
 
     print(f"\nScreened {len(results)} site(s): {len(ok)} analyzed, {len(errored)} with errors.")
     print(f"Results written to {out_path}\n")
@@ -2733,7 +2753,10 @@ def print_screen_summary(results, out_path):
         count_display = str(count) if isinstance(count, int) else "-"
         label = (r.get("name") or r.get("website") or "(unnamed)")[:44]
         suffix = f"   [{r['error'][:52]}]" if r.get("error") else ""
-        print(f"  {i:>3}  {count_display:>8}  {str(r.get('platform') or '-'):<14} "
+        platform_label = str(r.get("platform") or "-")
+        if r.get("platform_confidence") == "weak":
+            platform_label += "?"   # single-signal match - verify before pitching
+        print(f"  {i:>3}  {count_display:>8}  {platform_label:<14} "
                f"{str(r.get('page_builder') or '-'):<10} {label}{suffix}")
 
     platforms = Counter(r.get("platform") or "-" for r in ok)
@@ -2744,6 +2767,11 @@ def print_screen_summary(results, out_path):
             if name in PLATFORM_OWNS_PERFORMANCE:
                 note = "  <- platform owns performance; speed findings not yours to fix"
             print(f"  {n:>3}  {name}{note}")
+
+    weak = [r for r in ok if r.get("platform_confidence") == "weak"]
+    if weak:
+        print(f"\n{len(weak)} platform detection(s) marked '?' matched on a single signal - "
+               "filter platform_confidence=weak to review before pitching.")
 
 
 # --------------------------------------------------------------------------
