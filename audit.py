@@ -100,9 +100,26 @@ STATE_FILE_TEMPLATE = "audit_state_{domain}.pkl"
                                  # Named per-domain, and the audited base_url is
                                  # stored inside and re-checked on load, so a
                                  # checkpoint can never be applied to another site.
+# Identity this tool presents to every site it touches.
+#
+# Deliberately not a browser string. The pitch this tool supports is "I looked
+# at your site and found something specific" - an owner who checks their logs
+# should be able to see exactly who scanned them and why, and look it up. A
+# spoofed Chrome header would buy a few extra reachable sites at the cost of
+# the credibility the whole approach rests on.
+#
+# Format follows the well-behaved-crawler convention (cf. Googlebot):
+#   Mozilla/5.0 (compatible; <bot>/<ver>; +<info url>; <operator>)
+# The "compatible" token is the standard bot form and carries no OS/browser
+# claim, unlike a full platform token.
+AUDIT_BOT_NAME = "SiteAuditBot"
+AUDIT_BOT_VERSION = "1.1"
+AUDIT_CONTACT_URL = "https://example.com/site-audit-bot"  # TODO: point at the real page once it's up
+AUDIT_OPERATOR = "Dominick Kubica"
 USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SiteAuditBot/1.0 "
-    "(+https://github.com/; automated site health audit)"
+    f"Mozilla/5.0 (compatible; {AUDIT_BOT_NAME}/{AUDIT_BOT_VERSION}; "
+    f"+{AUDIT_CONTACT_URL}; operated by {AUDIT_OPERATOR}; "
+    "automated site health audit)"
 )
 
 BOOKING_KEYWORDS = ["momence", "vagaro"]
