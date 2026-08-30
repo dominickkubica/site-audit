@@ -114,13 +114,18 @@ STATE_FILE_TEMPLATE = "audit_state_{domain}.pkl"
 # claim, unlike a full platform token.
 AUDIT_BOT_NAME = "SiteAuditBot"
 AUDIT_BOT_VERSION = "1.1"
-AUDIT_CONTACT_URL = "https://example.com/site-audit-bot"  # TODO: point at the real page once it's up
+AUDIT_CONTACT_URL = "https://executecoaching.org"
 AUDIT_OPERATOR = "Dominick Kubica"
 USER_AGENT = (
     f"Mozilla/5.0 (compatible; {AUDIT_BOT_NAME}/{AUDIT_BOT_VERSION}; "
     f"+{AUDIT_CONTACT_URL}; operated by {AUDIT_OPERATOR}; "
     "automated site health audit)"
 )
+# The token to match robots.txt User-agent lines against - NOT the full header.
+# RobotFileParser compares everything before the first "/" of whatever it is
+# given, so passing USER_AGENT would compare "mozilla" and silently miss a
+# rule naming this bot directly.
+ROBOTS_USER_AGENT = AUDIT_BOT_NAME
 
 BOOKING_KEYWORDS = ["momence", "vagaro"]
 CHECKOUT_DOMAINS = ["momence.com", "vagaro.com", "checkout.stripe.com", "square.site", "squareup.com"]
@@ -613,7 +618,7 @@ def crawl(base_url):
         url = queue.pop(0)
         if url in visited:
             continue
-        if has_robots and not rp.can_fetch(USER_AGENT, url):
+        if has_robots and not rp.can_fetch(ROBOTS_USER_AGENT, url):
             log.info("Skipping (robots.txt disallow): %s", url)
             continue
         visited.add(url)
@@ -2591,11 +2596,45 @@ def resolve_websites(rows, fieldnames, csv_path, max_lookups):
     return resolved
 
 
+ROBOTS_BLOCKED_ERROR = "blocked by robots.txt"
+
+_robots_cache = {}  # netloc -> (RobotFileParser, has_robots)
+
+
+def robots_allows(url):
+    """Does this site's robots.txt permit us to fetch this URL?
+
+    Screen mode costs one extra request per domain for this. That is a
+    deliberate trade: a site that has explicitly named this bot and told it to
+    stay out gets honored, and is reported as its own status rather than
+    silently skipped or misfiled as broken. Cached per netloc so a prospect
+    list with several URLs on one domain only pays once.
+
+    Fails open - an unreachable or missing robots.txt means no restrictions,
+    which is the standard interpretation."""
+    netloc = urlparse(url).netloc
+    if netloc not in _robots_cache:
+        _robots_cache[netloc] = load_robots(url)
+    rp, has_robots = _robots_cache[netloc]
+    if not has_robots:
+        return True
+    try:
+        return rp.can_fetch(ROBOTS_USER_AGENT, url)
+    except Exception:  # noqa: BLE001 - a malformed robots.txt must not block the run
+        return True
+
+
 def screen_status(result):
-    """Single source of truth for the status column: a row is 'ok' only if
-    nothing went wrong. Derived rather than set at each return point, so no
-    failure path can forget it."""
-    return "error" if result.get("error") else "ok"
+    """Single source of truth for the status column. Derived rather than set at
+    each return point, so no failure path can forget it.
+
+    'blocked' is distinct from 'error': the site works fine, it just told this
+    bot not to crawl. Those are prospects to reach another way, not broken
+    sites to write off."""
+    error = result.get("error") or ""
+    if error == ROBOTS_BLOCKED_ERROR:
+        return "blocked"
+    return "error" if error else "ok"
 
 
 def screen_site(url, want_psi, timeout):
@@ -2609,6 +2648,11 @@ def screen_site(url, want_psi, timeout):
 def _screen_site(url, want_psi, timeout):
     result = {c: "" for c in SCREEN_CSV_COLUMNS}
     result["website"] = url
+
+    if not robots_allows(url):
+        log.info("robots.txt disallows %s for %s - not fetching", url, AUDIT_BOT_NAME)
+        result["error"] = ROBOTS_BLOCKED_ERROR
+        return result
 
     start = time.monotonic()
     resp, transport_error = safe_get(url, timeout=timeout, allow_redirects=True, return_error=True)
@@ -2759,9 +2803,12 @@ def print_screen_summary(results, out_path):
 
     ranked = sorted(results, key=sort_key)
     ok = [r for r in results if r.get("status") == "ok"]
-    errored = [r for r in results if r.get("status") != "ok"]
+    blocked = [r for r in results if r.get("status") == "blocked"]
+    errored = [r for r in results if r.get("status") == "error"]
 
-    print(f"\nScreened {len(results)} site(s): {len(ok)} analyzed, {len(errored)} with errors.")
+    summary = f"\nScreened {len(results)} site(s): {len(ok)} analyzed, {len(errored)} with errors"
+    summary += f", {len(blocked)} blocked by robots.txt." if blocked else "."
+    print(summary)
     print(f"Results written to {out_path}\n")
     print("Outreach priority (most findings first):")
     print(f"  {'#':>3}  {'findings':>8}  {'platform':<14} {'builder':<10} name")
@@ -2789,6 +2836,12 @@ def print_screen_summary(results, out_path):
     if weak:
         print(f"\n{len(weak)} platform detection(s) marked '?' matched on a single signal - "
                "filter platform_confidence=weak to review before pitching.")
+
+    if blocked:
+        print(f"\n{len(blocked)} site(s) told this bot not to crawl (status=blocked). Their sites "
+               "are not broken - reach these another way rather than writing them off:")
+        for r in blocked:
+            print(f"  - {r.get('name') or r.get('website')}  {r.get('website')}")
 
 
 # --------------------------------------------------------------------------
