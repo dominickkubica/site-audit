@@ -42,6 +42,7 @@ import logging
 import os
 import pickle
 import re
+import shutil
 import socket
 import ssl
 import sys
@@ -86,6 +87,9 @@ SCREEN_CSV_COLUMNS = [
     "contacted", "channel", "replied", "call_booked", "closed", "objection",
 ]
 SCREEN_MANUAL_COLUMNS = ["contacted", "channel", "replied", "call_booked", "closed", "objection"]
+# host[:port] - permissive enough for IDNs and odd TLDs, strict enough to
+# reject the free-text junk that ends up in a scraped prospect list
+HOSTNAME_RE = re.compile(r"^[^\s/?#@:]+(:\d+)?$")
 STATE_FILE_TEMPLATE = "audit_state_{domain}.pkl"
                                  # checkpoint of crawl_data + auto-detected issues,
                                  # so the PDF can be rebuilt (e.g. to add manual
@@ -255,8 +259,44 @@ session = requests.Session()
 session.headers.update({"User-Agent": USER_AGENT})
 
 
-def safe_get(url, method="GET", **kwargs):
-    """Rate-limited, exception-safe HTTP request. Returns a Response or None."""
+def classify_request_error(exc):
+    """Map a requests exception to a short, human-readable cause.
+
+    Screen mode reports these verbatim in its CSV across hundreds of sites, so
+    "DNS did not resolve" and "connection timed out" need to stay distinct
+    rather than collapsing into one generic failure string."""
+    if isinstance(exc, requests.exceptions.ConnectTimeout):
+        return "connection timed out"
+    if isinstance(exc, requests.exceptions.ReadTimeout):
+        return "server accepted the connection but never responded"
+    if isinstance(exc, requests.exceptions.Timeout):
+        return "timed out"
+    if isinstance(exc, requests.exceptions.SSLError):
+        return "SSL/TLS error (bad or expired certificate)"
+    if isinstance(exc, requests.exceptions.TooManyRedirects):
+        return "redirect loop"
+    if isinstance(exc, requests.exceptions.InvalidURL):
+        return "malformed URL"
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        text = str(exc)
+        if "NameResolutionError" in text or "getaddrinfo failed" in text or "Name or service not known" in text:
+            return "domain does not resolve (DNS)"
+        if "ConnectTimeoutError" in text or "timed out" in text:
+            return "connection timed out"
+        if "RemoteDisconnected" in text or "ConnectionResetError" in text or "reset by peer" in text:
+            return "connection reset by server"
+        if "refused" in text:
+            return "connection refused"
+        return "could not connect"
+    return f"{type(exc).__name__}"
+
+
+def safe_get(url, method="GET", return_error=False, **kwargs):
+    """Rate-limited, exception-safe HTTP request.
+
+    Returns a Response or None. With return_error=True returns
+    (response_or_None, error_string) so callers that surface failures to a
+    human can say why; the default single-value contract is unchanged."""
     limiter.wait()
     try:
         kwargs.setdefault("timeout", REQUEST_TIMEOUT)
@@ -269,10 +309,10 @@ def safe_get(url, method="GET", **kwargs):
                 resp = session.get(url, stream=True, **kwargs)
         else:
             resp = session.get(url, **kwargs)
-        return resp
+        return (resp, "") if return_error else resp
     except requests.exceptions.RequestException as exc:
         log.warning("Request failed for %s: %s", url, exc)
-        return None
+        return (None, classify_request_error(exc)) if return_error else None
 
 
 # --------------------------------------------------------------------------
@@ -649,22 +689,31 @@ _psi_consecutive_failures = 0
 _psi_disabled = False
 
 
-def load_pagespeed_cache():
-    if os.path.exists(PAGESPEED_CACHE_FILE):
+def load_json_cache(path, label):
+    """Read a JSON cache file, returning {} if it is missing or unreadable."""
+    if os.path.exists(path):
         try:
-            with open(PAGESPEED_CACHE_FILE, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except (json.JSONDecodeError, OSError) as exc:
-            log.warning("Could not read PageSpeed cache (%s) - starting fresh", exc)
+            log.warning("Could not read %s cache (%s) - starting fresh", label, exc)
     return {}
 
 
-def save_pagespeed_cache(cache):
+def save_json_cache(path, cache, label):
     try:
-        with open(PAGESPEED_CACHE_FILE, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(cache, f)
     except OSError as exc:
-        log.warning("Could not write PageSpeed cache: %s", exc)
+        log.warning("Could not write %s cache: %s", label, exc)
+
+
+def load_pagespeed_cache():
+    return load_json_cache(PAGESPEED_CACHE_FILE, "PageSpeed")
+
+
+def save_pagespeed_cache(cache):
+    save_json_cache(PAGESPEED_CACHE_FILE, cache, "PageSpeed")
 
 
 def parse_pagespeed_response(data, strategy):
@@ -952,12 +1001,24 @@ def short_label(url, max_len=60):
     return f".../{tail}"
 
 
-def detect_issues(crawl_data, link_status, image_findings):
+def detect_issues(crawl_data, link_status, image_findings, include_site_level=True):
+    """Detect issues from crawl data.
+
+    include_site_level=False restricts detection to checks that are decidable
+    from a single fetched page, skipping the two blocks that need crawl
+    context: the robots.txt/sitemap probes (screen mode never requests them,
+    so their absence is unknown rather than false) and the cross-page
+    aggregates at the end (duplicate titles/descriptions/content, orphan
+    pages, broken links). Everything in the per-page loop runs either way, so
+    screen mode and report mode share one detection implementation.
+
+    Anything decidable from one page's HTML belongs in the per-page loop, not
+    in the site-level blocks, or screen mode will silently lose it."""
     issues = []
     pages = crawl_data["pages"]
     base_url = crawl_data["base_url"]
 
-    if not crawl_data["has_robots"]:
+    if include_site_level and not crawl_data["has_robots"]:
         add_issue(issues, "SEO", "robots.txt is missing or unreachable", "Medium", "Quick",
                    "Search engines use robots.txt to understand crawl permissions; without it, "
                    "crawl behavior is left entirely to default engine heuristics and you lose a "
@@ -967,7 +1028,7 @@ def detect_issues(crawl_data, link_status, image_findings):
                     "Verify the file is publicly accessible at /robots.txt with a 200 status."],
                    page_url=base_url)
 
-    if not crawl_data["sitemap_found"]:
+    if include_site_level and not crawl_data["sitemap_found"]:
         add_issue(issues, "SEO", "XML sitemap not found at standard location", "Medium", "Quick",
                    "An XML sitemap helps search engines discover and prioritize pages, especially "
                    "on sites with dynamic Elementor-built pages that may have weak internal linking.",
@@ -1354,6 +1415,11 @@ def detect_issues(crawl_data, link_status, image_findings):
                        page_url=url)
 
     # --- Site-wide checks -------------------------------------------------
+    # Everything below needs more than one crawled page (cross-page duplicate
+    # detection, orphan detection, link-check results), so screen mode skips it.
+    if not include_site_level:
+        return issues
+
     for title_text, urls in titles.items():
         if len(urls) > 1:
             add_issue(issues, "SEO", "Duplicate page titles across multiple pages", "Medium", "Quick",
@@ -2084,6 +2150,347 @@ def add_manual_findings(issues, base_url):
 
 
 # --------------------------------------------------------------------------
+# Platform detection - real implementation lands in the next commit.
+# Screen mode consumes these now; until then every site reports as unknown,
+# which is the correct conservative answer rather than a guess.
+# --------------------------------------------------------------------------
+
+PLATFORM_OWNS_PERFORMANCE = {"wix", "squarespace"}
+
+
+@dataclass
+class PlatformInfo:
+    platform: str = "unknown"
+    page_builder: str = ""
+    confidence: str = "none"
+    signals: list = field(default_factory=list)
+
+
+def detect_platform(pd, soup):
+    return PlatformInfo()
+
+
+def apply_platform_advice(issues, platform_info):
+    return issues
+
+
+# --------------------------------------------------------------------------
+# Screen mode - fast homepage-only triage across many prospects
+#
+# Deliberately not a mini-audit: one GET per site, no crawl, no link or image
+# checking, no PDF, no state pickle. Detection reuses detect_issues() with
+# include_site_level=False rather than a second copy that could drift.
+# --------------------------------------------------------------------------
+
+def load_places_cache():
+    return load_json_cache(PLACES_CACHE_FILE, "Places")
+
+
+def save_places_cache(cache):
+    save_json_cache(PLACES_CACHE_FILE, cache, "Places")
+
+
+def lookup_website(name, address, cache):
+    """Resolve a business's website via Google Places Text Search.
+
+    Returns (url_or_empty, error_or_empty, billed) where billed is True only
+    when a request actually went to the API, so the caller can enforce a cap
+    on spend. Cached negatives count as resolved - a business with no website
+    is a real answer worth remembering."""
+    query = " ".join(p for p in (name, address) if p).strip()
+    if not query:
+        return "", "no name or address to search", False
+
+    key = f"places:{query.lower()}"
+    cached = cache.get(key)
+    if cached and (time.time() - cached.get("_fetched_at", 0)) < PLACES_CACHE_TTL_SECONDS:
+        return cached.get("website", ""), cached.get("error", ""), False
+
+    if not PLACES_API_KEY:
+        return "", "no PLACES_API_KEY/PAGESPEED_API_KEY set", False
+
+    limiter.wait()
+    website, error = "", ""
+    try:
+        resp = requests.post(
+            PLACES_API_URL,
+            json={"textQuery": query, "maxResultCount": 1},
+            headers={"Content-Type": "application/json",
+                      "X-Goog-Api-Key": PLACES_API_KEY,
+                      "X-Goog-FieldMask": "places.websiteUri"},
+            timeout=REQUEST_TIMEOUT)
+    except requests.exceptions.RequestException as exc:
+        return "", f"places request failed: {exc}", True
+
+    if resp.status_code != 200:
+        detail = "quota/permission denied" if resp.status_code in (401, 403, 429) else f"HTTP {resp.status_code}"
+        return "", f"places lookup failed: {detail}", True
+
+    try:
+        places = (resp.json() or {}).get("places") or []
+        website = (places[0].get("websiteUri", "") if places else "").strip()
+        if not website:
+            error = "no website listed for this business"
+    except (ValueError, AttributeError, IndexError, TypeError) as exc:
+        error = f"unexpected places response: {exc}"
+
+    cache[key] = {"website": website, "error": error, "_fetched_at": time.time()}
+    return website, error, True
+
+
+def read_prospects(path):
+    """Read the input CSV, preserving column order and any extra columns."""
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            raise ValueError(f"{path} has no header row")
+        return [dict(row) for row in reader], list(reader.fieldnames)
+
+
+def write_prospects(path, rows, fieldnames):
+    """Write resolved websites back to the input CSV atomically, so an
+    interrupted run cannot leave a half-written prospect list."""
+    tmp = f"{path}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+        os.replace(tmp, path)
+    except OSError as exc:
+        log.warning("Could not write resolved websites back to %s: %s", path, exc)
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def resolve_websites(rows, fieldnames, csv_path, max_lookups):
+    """Fill blank website cells via Places, writing back what was resolved even
+    if the cap or an error stops the run early."""
+    blanks = [r for r in rows if not (r.get("website") or "").strip()]
+    if not blanks:
+        return 0
+    if "website" not in fieldnames:
+        fieldnames.append("website")
+
+    backup = f"{csv_path}.bak"
+    if not os.path.exists(backup):
+        try:
+            shutil.copyfile(csv_path, backup)
+            log.info("Backed up original prospect list to %s", backup)
+        except OSError as exc:
+            log.warning("Could not back up %s: %s", csv_path, exc)
+
+    cache = load_places_cache()
+    log.info("%d businesses have no website; resolving via Places (cap: %d lookups)",
+              len(blanks), max_lookups)
+    billed = resolved = 0
+    capped = False
+    try:
+        for row in blanks:
+            if billed >= max_lookups:
+                capped = True
+                break
+            site, error, was_billed = lookup_website(row.get("name", ""), row.get("address", ""), cache)
+            billed += 1 if was_billed else 0
+            if site:
+                row["website"] = site
+                resolved += 1
+            elif error:
+                log.info("No website for %r: %s", row.get("name", ""), error)
+    finally:
+        # Persist before any early exit so a stopped run is never wasted.
+        save_places_cache(cache)
+        write_prospects(csv_path, rows, fieldnames)
+
+    log.info("Resolved %d website(s) using %d billable lookup(s); written back to %s",
+              resolved, billed, csv_path)
+    if capped:
+        log.warning("Stopped at the --max-lookups cap of %d. %d business(es) still have no "
+                     "website. Everything resolved so far has been saved to %s - re-run with a "
+                     "higher --max-lookups to continue where this left off.",
+                     max_lookups, len([r for r in rows if not (r.get('website') or '').strip()]), csv_path)
+    return resolved
+
+
+def screen_site(url, want_psi, timeout):
+    """Triage one site from its homepage alone. Returns a result dict; never
+    raises - transport and parse failures come back in the 'error' field."""
+    result = {c: "" for c in SCREEN_CSV_COLUMNS}
+    result["website"] = url
+
+    start = time.monotonic()
+    resp, transport_error = safe_get(url, timeout=timeout, allow_redirects=True, return_error=True)
+    elapsed = time.monotonic() - start
+    if resp is None:
+        result["error"] = transport_error or "unreachable"
+        return result
+
+    final_url = resp.url or url
+    result["website"] = final_url
+    if len(resp.history) > 3:
+        log.info("%s redirected %d times, ending at %s", url, len(resp.history), final_url)
+    if resp.status_code >= 400:
+        result["error"] = f"HTTP {resp.status_code}"
+        if resp.status_code in (401, 403):
+            result["error"] += " (blocked to non-browser agents)"
+        return result
+
+    content_type = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if content_type and "html" not in content_type:
+        result["error"] = f"not an HTML page (content-type: {content_type})"
+        return result
+
+    try:
+        soup = BeautifulSoup(resp.text, "html.parser")
+    except Exception as exc:  # noqa: BLE001 - malformed markup must not kill the run
+        result["error"] = f"could not parse HTML: {exc}"
+        return result
+
+    pd = PageData(url=final_url, status_code=resp.status_code, ok=True,
+                   load_time=elapsed, size_bytes=len(resp.content),
+                   headers=dict(resp.headers))
+    try:
+        analyze_page(pd, soup, urlparse(final_url).netloc)
+    except Exception as exc:  # noqa: BLE001
+        result["error"] = f"could not analyze page: {exc}"
+        return result
+
+    platform = detect_platform(pd, soup)
+    result["platform"] = platform.platform
+    result["page_builder"] = platform.page_builder
+
+    if want_psi:
+        cache = load_pagespeed_cache()
+        psi = fetch_pagespeed(final_url, "mobile", cache)
+        save_pagespeed_cache(cache)
+        pd.psi["mobile"] = psi
+        if psi.performance_score is not None:
+            result["psi_mobile_score"] = psi.performance_score
+        result["psi_mobile_lcp"] = psi.lcp_display or ""
+        if psi.error and psi.performance_score is None:
+            result["error"] = f"pagespeed: {psi.error}"
+
+    crawl_data = {
+        "base_url": final_url,
+        "pages": {final_url: pd},
+        "incoming_links": {},
+        "has_robots": True,      # not probed in screen mode - unknown, not missing
+        "sitemap_found": True,   # ditto
+        "sitemap_url": "",
+        "all_internal_links_seen": set(),
+    }
+    try:
+        issues = detect_issues(crawl_data, {}, {}, include_site_level=False)
+        apply_platform_advice(issues, platform)
+    except Exception as exc:  # noqa: BLE001
+        result["error"] = f"detection failed: {exc}"
+        return result
+
+    result["findings_count"] = len(issues)
+    result["findings"] = "; ".join(i.issue for i in sorted(
+        issues, key=lambda i: (SEVERITY_ORDER.get(i.severity, 9), i.category)))
+    return result
+
+
+def cmd_screen(args):
+    if args.url:
+        rows = [{"name": domain_key(args.url), "website": args.url}]
+        fieldnames = None
+    else:
+        try:
+            rows, fieldnames = read_prospects(args.csv)
+        except (OSError, ValueError) as exc:
+            sys.stderr.write(f"error: could not read {args.csv}: {exc}\n")
+            sys.exit(2)
+        if not rows:
+            sys.stderr.write(f"error: {args.csv} contains no rows.\n")
+            sys.exit(2)
+        resolve_websites(rows, fieldnames, args.csv, args.max_lookups)
+
+    results = []
+    total = len(rows)
+    for idx, row in enumerate(rows, 1):
+        name = (row.get("name") or "").strip()
+        website = (row.get("website") or "").strip()
+        log.info("Screening (%d/%d): %s", idx, total, name or website or "(unnamed)")
+
+        result = {c: "" for c in SCREEN_CSV_COLUMNS}
+        result["name"] = name
+        result["website"] = website
+        try:
+            if not website:
+                result["error"] = "no website"
+            else:
+                if not urlparse(website).scheme:
+                    website = f"https://{website}"
+                    result["website"] = website
+                parsed = urlparse(website)
+                if parsed.scheme not in ("http", "https"):
+                    result["error"] = f"unsupported URL scheme: {parsed.scheme or website}"
+                elif not parsed.netloc or not HOSTNAME_RE.match(parsed.netloc):
+                    # Catch junk before spending a request and a DNS timeout on it.
+                    result["error"] = "malformed URL"
+                else:
+                    screened = screen_site(website, args.psi, args.timeout)
+                    screened["name"] = name
+                    result = screened
+        except Exception as exc:  # noqa: BLE001 - one bad host must not end a 200-site run
+            result["error"] = f"unexpected failure: {type(exc).__name__}: {exc}"
+            log.warning("Unexpected failure screening %s: %s", website, exc, exc_info=True)
+        results.append(result)
+
+    write_screen_results(args.out, results)
+    print_screen_summary(results, args.out)
+
+
+def write_screen_results(path, results):
+    try:
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=SCREEN_CSV_COLUMNS, extrasaction="ignore")
+            writer.writeheader()
+            for row in results:
+                writer.writerow({c: row.get(c, "") for c in SCREEN_CSV_COLUMNS})
+    except OSError as exc:
+        log.error("Could not write results to %s: %s", path, exc)
+        raise
+
+
+def print_screen_summary(results, out_path):
+    """Ranked by finding count descending - this is the outreach order."""
+    def sort_key(r):
+        count = r.get("findings_count")
+        return -(count if isinstance(count, int) else -1)
+
+    ranked = sorted(results, key=sort_key)
+    ok = [r for r in results if not r.get("error")]
+    errored = [r for r in results if r.get("error")]
+
+    print(f"\nScreened {len(results)} site(s): {len(ok)} analyzed, {len(errored)} with errors.")
+    print(f"Results written to {out_path}\n")
+    print("Outreach priority (most findings first):")
+    print(f"  {'#':>3}  {'findings':>8}  {'platform':<14} {'builder':<10} name")
+    for i, r in enumerate(ranked, 1):
+        count = r.get("findings_count")
+        count_display = str(count) if isinstance(count, int) else "-"
+        label = (r.get("name") or r.get("website") or "(unnamed)")[:44]
+        suffix = f"   [{r['error'][:52]}]" if r.get("error") else ""
+        print(f"  {i:>3}  {count_display:>8}  {str(r.get('platform') or '-'):<14} "
+               f"{str(r.get('page_builder') or '-'):<10} {label}{suffix}")
+
+    platforms = Counter(r.get("platform") or "-" for r in ok)
+    if platforms:
+        print("\nPlatform mix (analyzed sites):")
+        for name, n in platforms.most_common():
+            note = ""
+            if name in PLATFORM_OWNS_PERFORMANCE:
+                note = "  <- platform owns performance; speed findings not yours to fix"
+            print(f"  {n:>3}  {name}{note}")
+
+
+# --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
 
@@ -2202,10 +2609,6 @@ def cmd_report(args):
 
     build_pdf(crawl_data["base_url"], issues, crawl_data, output_pdf)
     print(f"\nDone. Report saved to {output_pdf}")
-
-
-def cmd_screen(args):
-    raise NotImplementedError("screen mode lands in the next commit")
 
 
 if __name__ == "__main__":
