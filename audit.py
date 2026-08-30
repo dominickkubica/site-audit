@@ -587,6 +587,7 @@ def crawl(base_url):
     pages = {}
     incoming_links = defaultdict(set)  # url -> set of pages linking to it
     all_internal_links_seen = set()
+    platform = PlatformInfo()
 
     while queue and len(visited) < MAX_PAGES:
         url = queue.pop(0)
@@ -603,6 +604,16 @@ def crawl(base_url):
                 analyze_page(pd, soup, base_netloc)
             except Exception as exc:  # noqa: BLE001 - never let one page crash the crawl
                 log.warning("Failed to analyze %s: %s", url, exc)
+            if url == base_url:
+                # Detected here because it needs the parsed homepage, which is
+                # not retained past the crawl.
+                try:
+                    platform = detect_platform(pd, soup)
+                    log.info("Platform: %s%s (%s confidence)", platform.platform,
+                              f" + {platform.page_builder}" if platform.page_builder else "",
+                              platform.confidence)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("Platform detection failed: %s", exc)
         pages[url] = pd
 
         if soup is not None:
@@ -620,6 +631,7 @@ def crawl(base_url):
         "sitemap_found": sitemap_found,
         "sitemap_url": sitemap_url,
         "all_internal_links_seen": all_internal_links_seen,
+        "platform": platform,
     }
 
 
@@ -2150,27 +2162,271 @@ def add_manual_findings(issues, base_url):
 
 
 # --------------------------------------------------------------------------
-# Platform detection - real implementation lands in the next commit.
-# Screen mode consumes these now; until then every site reports as unknown,
-# which is the correct conservative answer rather than a guess.
+# Platform detection
+#
+# This drives a commercial decision, not a cosmetic label, so it is tuned for
+# precision over coverage: a platform is only claimed on a signal that no
+# other stack realistically produces, and anything weaker returns "unknown".
+# A wrong answer sends a pitch to someone who cannot act on it, or skips
+# someone who can - both cost more than an honest "unknown".
+#
+# The distinction that matters commercially:
+#   - Wix/Squarespace own the rendering pipeline. Their performance ceiling is
+#     not the owner's to raise and not ours to sell.
+#   - WordPress with a page builder is the opposite: the bloat belongs to the
+#     site owner, is measurable, and is removable by us.
 # --------------------------------------------------------------------------
 
 PLATFORM_OWNS_PERFORMANCE = {"wix", "squarespace"}
+
+# (label, [substrings matched against asset URLs / inline script text])
+PLATFORM_ASSET_SIGNALS = [
+    ("wordpress",   ["/wp-content/", "/wp-includes/", "/wp-json/"]),
+    ("wix",         ["static.parastorage.com", "static.wixstatic.com", "wix-code", "wixsite.com"]),
+    ("squarespace", ["static1.squarespace.com", "squarespace-cdn.com", "assets.squarespace.com"]),
+    ("shopify",     ["cdn.shopify.com", "shopifycloud.com", "shopify.theme", "myshopify.com"]),
+    ("webflow",     ["assets.website-files.com", "assets-global.website-files.com",
+                      "cdn.prod.website-files.com", "webflow.js"]),
+    ("framer",      ["framerusercontent.com", "framer.com/m/", "framer-motion"]),
+]
+
+# Page builders, checked only once WordPress is established. Ordered so that
+# an explicit builder wins over Gutenberg, which ships with WordPress itself.
+BUILDER_SIGNALS = [
+    ("Elementor", ["/plugins/elementor/", "elementor-frontend", "elementor-page",
+                    "elementor-widget", "elementor-section"]),
+    ("Divi",      ["/themes/divi/", "et_pb_", "et-core", "divi-builder"]),
+    ("WPBakery",  ["js_composer", "vc_row", "wpb_wrapper", "/js_composer/"]),
+    ("Beaver",    ["/bb-plugin/", "fl-builder", "fl-node-"]),
+    ("Gutenberg", ["wp-block-", "/block-library/", "wp-container-"]),
+]
+
+GENERATOR_SIGNALS = [
+    ("wordpress", "wordpress"),
+    ("wix", "wix.com"),
+    ("squarespace", "squarespace"),
+    ("shopify", "shopify"),
+    ("webflow", "webflow"),
+    ("framer", "framer"),
+    ("drupal", "drupal"),
+    ("joomla", "joomla"),
+]
+
+HEADER_SIGNALS = [
+    ("wix", ["x-wix-request-id", "x-wix-published-version"]),
+    ("squarespace", ["x-contextid"]),
+    ("shopify", ["x-shopid", "x-shopify-stage"]),
+]
+
+# Frontend frameworks. Only reported when nothing above matched, and only as
+# "react/custom" - the framework says who built it, not what the owner can change.
+FRAMEWORK_SIGNALS = ["__next_data__", "/_next/static", "data-reactroot", "react-dom",
+                      "__nuxt__", "ng-version", "data-svelte"]
 
 
 @dataclass
 class PlatformInfo:
     platform: str = "unknown"
     page_builder: str = ""
-    confidence: str = "none"
+    confidence: str = "none"   # strong | weak | none
     signals: list = field(default_factory=list)
+
+    @property
+    def owns_performance(self):
+        """True when the platform, not the site owner, controls the
+        performance ceiling - so speed findings are not sellable work."""
+        return self.platform in PLATFORM_OWNS_PERFORMANCE
+
+
+def _platform_haystack(pd, soup):
+    """Asset URLs plus a bounded slice of inline markup. Inline text is capped
+    because homepages can carry megabytes of inline JSON, and every signal we
+    look for appears early if it appears at all."""
+    parts = list(pd.script_srcs or [])
+    parts.extend(pd.image_srcs or [])
+    for tag in soup.find_all("link", href=True):
+        parts.append(tag["href"])
+    body = str(soup)[:200_000]
+    parts.append(body)
+    return " ".join(parts).lower()
 
 
 def detect_platform(pd, soup):
-    return PlatformInfo()
+    """Identify the CMS/site builder and, for WordPress, the page builder.
+
+    Returns PlatformInfo with confidence 'strong' when a generator tag, a
+    platform-owned header, or two independent asset signals agree; 'weak' when
+    a single asset signal matched; 'none' (platform 'unknown') otherwise.
+    Weak matches still report the platform but are flagged, so a caller that
+    needs certainty can require confidence == 'strong'."""
+    signals = []
+    haystack = _platform_haystack(pd, soup)
+
+    generator = soup.find("meta", attrs={"name": re.compile("^generator$", re.I)})
+    generator_content = (generator.get("content", "") or "").lower() if generator else ""
+
+    headers_lower = {k.lower() for k in (pd.headers or {})}
+
+    platform = ""
+    confidence = "none"
+
+    # 1. Generator meta tag - the site telling us directly.
+    for label, needle in GENERATOR_SIGNALS:
+        if needle in generator_content:
+            platform, confidence = label, "strong"
+            signals.append(f"generator:{needle}")
+            break
+
+    # 2. Platform-owned response headers - not forgeable by a theme.
+    if not platform:
+        for label, header_names in HEADER_SIGNALS:
+            hit = [h for h in header_names if h in headers_lower]
+            if hit:
+                platform, confidence = label, "strong"
+                signals.append(f"header:{hit[0]}")
+                break
+
+    # 3. Asset URL patterns. Two independent hits to claim strong, one is weak.
+    if not platform:
+        for label, needles in PLATFORM_ASSET_SIGNALS:
+            hits = [n for n in needles if n in haystack]
+            if hits:
+                platform = label
+                confidence = "strong" if len(hits) >= 2 else "weak"
+                signals.extend(f"asset:{h}" for h in hits[:3])
+                break
+
+    # 4. Frontend framework, only when no CMS matched at all.
+    if not platform:
+        hits = [n for n in FRAMEWORK_SIGNALS if n in haystack]
+        if hits:
+            platform = "react/custom"
+            confidence = "strong" if len(hits) >= 2 else "weak"
+            signals.extend(f"framework:{h}" for h in hits[:3])
+
+    if not platform:
+        return PlatformInfo(platform="unknown", confidence="none", signals=[])
+
+    builder = ""
+    if platform == "wordpress":
+        for label, needles in BUILDER_SIGNALS:
+            hits = [n for n in needles if n in haystack]
+            if hits:
+                builder = label
+                signals.extend(f"builder:{h}" for h in hits[:2])
+                break
+
+    return PlatformInfo(platform=platform, page_builder=builder,
+                        confidence=confidence, signals=signals)
+
+
+# --------------------------------------------------------------------------
+# Platform-appropriate remediation advice
+#
+# Findings are detected identically on every platform - a 4MB page is a 4MB
+# page. Only the fix text is platform-specific, so it is rewritten here at
+# output time rather than branching inside every detector.
+#
+# Substitution over deletion: a bullet naming WordPress-only tooling is
+# replaced with its generic equivalent, not dropped, because a finding with
+# vaguer advice is more useful than a finding with no advice.
+# --------------------------------------------------------------------------
+
+# (regex matched against a solution bullet, generic replacement)
+WORDPRESS_ADVICE_SUBSTITUTIONS = [
+    (re.compile(r"enable elementor's built-in native lazy-loading[^.]*\.", re.I),
+     "Enable lazy loading in your theme or site builder's performance settings."),
+    (re.compile(r"use a lazy-load plugin[^.]*\.", re.I),
+     "Enable lazy loading for below-the-fold images, or add loading=\"lazy\" to their <img> tags."),
+    (re.compile(r"re-save/re-insert images through the media library[^.]*\.", re.I),
+     "Re-insert the images through your site builder so width and height attributes are set."),
+    (re.compile(r"(install/?e?n?a?b?l?e?|use) (yoast|rankmath|aioseo)[^.]*\.", re.I),
+     "Use your platform's built-in SEO settings, or an SEO app/extension, to set this."),
+    (re.compile(r"[^.]*\byoast/rankmath\b[^.]*\.", re.I),
+     "Set this in your platform's page/SEO settings."),
+    (re.compile(r"enable a caching plugin[^.]*\.", re.I),
+     "Enable caching and a CDN through your platform or host."),
+    (re.compile(r"audit and disable unused elementor widgets/plugins[^.]*\.", re.I),
+     "Audit installed apps/extensions and remove any that load on every page without being used."),
+    (re.compile(r"upgrade hosting tier or move to managed wordpress hosting[^.]*\.", re.I),
+     "Upgrade to a faster hosting tier or plan."),
+    (re.compile(r"remove unused elementor widgets/sections[^.]*\.", re.I),
+     "Remove unused page sections and embedded widgets that add hidden weight."),
+    (re.compile(r"reduce the number of nested elementor sections/columns[^.]*\.", re.I),
+     "Reduce deeply nested page sections and columns."),
+    (re.compile(r"use an asset-unloading plugin[^.]*\.", re.I),
+     "Load scripts only on the pages that need them."),
+    (re.compile(r"(minify and combine css/js via a performance plugin|use a performance plugin's[^.]*)\.", re.I),
+     "Minify and combine CSS/JS, and defer non-critical JavaScript."),
+    (re.compile(r"install google tag manager site-wide via a plugin[^.]*\.", re.I),
+     "Install Google Tag Manager site-wide through your platform's integrations or header-code setting."),
+    (re.compile(r"add missing headers via a security plugin[^.]*\.", re.I),
+     "Add the missing headers through your host or CDN configuration (e.g. Cloudflare)."),
+    (re.compile(r"force https site-wide via wordpress settings[^.]*\.", re.I),
+     "Force HTTPS site-wide in your platform or host settings."),
+    (re.compile(r"add a single, keyword-relevant h1 via the page/elementor heading widget\.", re.I),
+     "Add a single, keyword-relevant H1 using your page editor's heading element."),
+    (re.compile(r"check elementor templates[^.]*\.", re.I),
+     "Check your page templates in case the H1 is styled as a plain text element."),
+    (re.compile(r"use a security plugin to strip version query strings[^.]*\.", re.I),
+     "Strip version query strings from asset URLs at the host or CDN level."),
+    (re.compile(r"remove the generator meta tag \(many security plugins[^)]*\)\.", re.I),
+     "Remove the generator meta tag if your platform allows it."),
+    (re.compile(r"consider a script-management plugin[^.]*\.", re.I),
+     "Load scripts conditionally so each page only requests what it uses."),
+    (re.compile(r"add descriptive alt text to each image in the media library\.", re.I),
+     "Add descriptive alt text to each image in your platform's media manager."),
+]
+
+# Residual platform-specific vocabulary in text we did not explicitly rewrite.
+GENERIC_TERM_SUBSTITUTIONS = [
+    (re.compile(r"\bElementor-built\b", re.I), "builder-built"),
+    (re.compile(r"\bElementor\b"), "the page builder"),
+    (re.compile(r"\bWordPress/Elementor\b", re.I), "site builder"),
+    (re.compile(r"\bWordPress\b"), "the site platform"),
+    (re.compile(r"\bplugins?\b"), "apps/extensions"),
+]
+
+
+def _genericize(text):
+    for pattern, replacement in GENERIC_TERM_SUBSTITUTIONS:
+        text = pattern.sub(replacement, text)
+    return text
 
 
 def apply_platform_advice(issues, platform_info):
+    """Rewrite WordPress-specific remediation advice for non-WordPress sites.
+
+    A complete no-op for WordPress and for unknown platforms - if we could not
+    identify the stack we have no basis to rewrite its advice, and the existing
+    wording is the more useful default. That also means this cannot perturb the
+    existing WordPress report."""
+    platform = getattr(platform_info, "platform", "unknown")
+    if platform in ("wordpress", "unknown"):
+        return issues
+
+    for issue in issues:
+        rewritten = []
+        for bullet in issue.solutions:
+            new_bullet = bullet
+            for pattern, replacement in WORDPRESS_ADVICE_SUBSTITUTIONS:
+                if pattern.search(new_bullet):
+                    new_bullet = pattern.sub(replacement, new_bullet).strip()
+                    break
+            new_bullet = _genericize(new_bullet)
+            if new_bullet and new_bullet not in rewritten:
+                rewritten.append(new_bullet)
+
+        # A finding must never end up with no advice at all.
+        issue.solutions = rewritten or [
+            "Review this on your platform and apply the equivalent fix in its settings."]
+        issue.why = _genericize(issue.why)
+
+        if platform in PLATFORM_OWNS_PERFORMANCE and issue.category == "Performance":
+            issue.solutions.append(
+                f"Note: {platform.title()} controls most of this page's loading pipeline, so "
+                "the achievable ceiling here is limited by the platform itself.")
+
     return issues
 
 
@@ -2604,6 +2860,12 @@ def cmd_report(args):
     else:
         log.info("Loaded cached crawl/issue data for %s from %s - skipping crawl, link/image checks, "
                   "and PageSpeed calls entirely.", crawl_data["base_url"], state_file_path(base_url))
+
+    # Rewrite platform-specific remediation advice before the hand-written
+    # manual findings are added - those are authored per client and must not be
+    # genericized. A no-op for WordPress and for checkpoints predating platform
+    # detection, which record no platform and so read as unknown.
+    apply_platform_advice(issues, crawl_data.get("platform") or PlatformInfo())
 
     add_manual_findings(issues, crawl_data["base_url"])
 
