@@ -5,6 +5,16 @@
 # PageSpeed Insights response cache (regenerable, 7-day TTL)
 pagespeed_cache.json
 
+# Places lookup cache - regenerable, but holds resolved business -> website
+# mappings that cost money to rebuild and are nobody else's to have
+places_cache.json
+
+# Prospect lists and screening results. These carry third-party business
+# contact data (names, addresses, phones) and private outreach tracking.
+# Deliberately never committed - keep them local or in your CRM.
+*.csv
+*.csv.bak
+
 # Generated reports - client deliverables, not source
 *.pdf
 # ...except the delivered v3 report, which is the regression baseline every
