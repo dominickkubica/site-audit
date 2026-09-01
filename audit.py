@@ -52,7 +52,7 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from urllib.parse import urljoin, urlparse, urldefrag
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urldefrag
 from urllib.robotparser import RobotFileParser
 
 import requests
@@ -922,20 +922,29 @@ def check_ssl_cert(hostname, port=443, timeout=10):
         return {"ok": False, "error": str(exc)}
 
 
-def check_security(crawl_data):
+def check_insecure_scheme(base_url):
+    """The one security check decidable from a single fetched page, split out
+    so screen mode can run it without the SSL socket connect and header
+    analysis that follow. Report mode calls it first, exactly where this
+    finding was previously emitted, so issue order is unchanged."""
     issues = []
-    base_url = crawl_data["base_url"]
-    parsed = urlparse(base_url)
-    homepage = crawl_data["pages"].get(base_url)
-
-    if parsed.scheme != "https":
+    if urlparse(base_url).scheme != "https":
         add_issue(issues, "Security", "Site is not served over HTTPS", "High", "Quick",
                    "Without HTTPS, all traffic (including any forms) travels unencrypted, browsers show "
                    "'Not Secure' warnings, and Google uses HTTPS as a ranking signal.",
                    ["Install an SSL certificate (Let's Encrypt is free) via your host's control panel.",
                     "Force HTTPS site-wide via WordPress settings or a redirect plugin."],
                    page_url=base_url)
-    else:
+    return issues
+
+
+def check_security(crawl_data):
+    base_url = crawl_data["base_url"]
+    parsed = urlparse(base_url)
+    homepage = crawl_data["pages"].get(base_url)
+
+    issues = check_insecure_scheme(base_url)
+    if parsed.scheme == "https":
         cert_info = check_ssl_cert(parsed.hostname)
         if not cert_info["ok"]:
             add_issue(issues, "Security", "Could not verify SSL certificate", "Low", "Quick",
@@ -2213,6 +2222,12 @@ PLATFORM_ASSET_SIGNALS = [
     ("webflow",     ["assets.website-files.com", "assets-global.website-files.com",
                       "cdn.prod.website-files.com", "webflow.js"]),
     ("framer",      ["framerusercontent.com", "framer.com/m/", "framer-motion"]),
+    # Common in local-business/agency markets, found in real screening runs
+    ("duda",        ["static.cdn-website.com", "_dm/s/rt/dist", "d-js-one-runtime", "dudaone"]),
+    ("godaddy",     ["img1.wsimg.com", "starfield technologies", "godaddy website builder"]),
+    ("hubspot",     ["js.hs-scripts.com", "js.hsforms.net", "hs-sites.com", "hubspotusercontent"]),
+    ("jane",        ["janeapp.com", "jane-app"]),
+    ("weebly",      ["weeblycloud", "weebly.com/editor", "cdn2.editmysite.com"]),
 ]
 
 # Page builders, checked only once WordPress is established. Ordered so that
@@ -2235,12 +2250,26 @@ GENERATOR_SIGNALS = [
     ("framer", "framer"),
     ("drupal", "drupal"),
     ("joomla", "joomla"),
+    ("godaddy", "go daddy"),
+    ("godaddy", "starfield technologies"),
+    ("hubspot", "hubspot"),
+    ("duda", "duda"),
+    ("weebly", "weebly"),
+    ("jane", "jane"),
 ]
 
+# Header keys are matched as substrings, so one entry covers a vendor's whole
+# family of headers (WP Engine alone ships several).
 HEADER_SIGNALS = [
     ("wix", ["x-wix-request-id", "x-wix-published-version"]),
     ("squarespace", ["x-contextid"]),
     ("shopify", ["x-shopid", "x-shopify-stage"]),
+    ("hubspot", ["x-hs-cf-cache-status", "x-hs-cache-config", "x-hubspot"]),
+    ("jane", ["x-jane-version"]),
+    ("duda", ["x-duda"]),
+    # Managed-WordPress hosts. Their headers are as reliable as a generator tag
+    # and survive the plugins that strip the generator meta for "security".
+    ("wordpress", ["wpengine", "x-kinsta-cache", "x-pantheon", "x-wpe-", "flywheel"]),
 ]
 
 # Frontend frameworks. Only reported when nothing above matched, and only as
@@ -2261,6 +2290,19 @@ class PlatformInfo:
         """True when the platform, not the site owner, controls the
         performance ceiling - so speed findings are not sellable work."""
         return self.platform in PLATFORM_OWNS_PERFORMANCE
+
+
+def clean_generator_label(content):
+    """Reduce a generator meta value to a short platform label.
+
+    Strips version numbers and URLs so "Growthstack by Influx v2.1" and
+    "Growthstack by Influx" collapse to one label that groups across a
+    prospect list."""
+    label = re.sub(r"https?://\S+", "", content or "")
+    label = re.sub(r"\bv?\d+(\.\d+)+\b", "", label)          # version numbers
+    label = re.sub(r"[;,]\s*$", "", label.strip())
+    label = re.sub(r"\s+", " ", label).strip(" -;,")
+    return label[:40].strip().lower()
 
 
 def _platform_haystack(pd, soup):
@@ -2302,10 +2344,11 @@ def detect_platform(pd, soup):
             signals.append(f"generator:{needle}")
             break
 
-    # 2. Platform-owned response headers - not forgeable by a theme.
+    # 2. Platform-owned response headers - not forgeable by a theme. Matched as
+    # substrings so one entry covers a vendor's whole header family.
     if not platform:
-        for label, header_names in HEADER_SIGNALS:
-            hit = [h for h in header_names if h in headers_lower]
+        for label, needles in HEADER_SIGNALS:
+            hit = [n for n in needles if any(n in h for h in headers_lower)]
             if hit:
                 platform, confidence = label, "strong"
                 signals.append(f"header:{hit[0]}")
@@ -2328,6 +2371,17 @@ def detect_platform(pd, soup):
             platform = "react/custom"
             confidence = "strong" if len(hits) >= 2 else "weak"
             signals.extend(f"framework:{h}" for h in hits[:3])
+
+    # 5. Nothing recognized, but the site declared a generator we don't have a
+    # signature for. Report it verbatim rather than discarding it: in real
+    # screening runs most "unknown" sites turn out to be niche builders that
+    # name themselves here, and the string is more useful than "unknown".
+    # Confidence is 'reported' - the site's own claim, not our identification.
+    if not platform and generator_content:
+        declared = clean_generator_label(generator_content)
+        if declared:
+            return PlatformInfo(platform=declared, confidence="reported",
+                                 signals=[f"generator:{generator_content[:60]}"])
 
     if not platform:
         return PlatformInfo(platform="unknown", confidence="none", signals=[])
@@ -2463,6 +2517,34 @@ def apply_platform_advice(issues, platform_info):
 # include_site_level=False rather than a second copy that could drift.
 # --------------------------------------------------------------------------
 
+TRACKING_PARAM_PREFIXES = ("utm_", "_hs", "mc_", "pk_", "matomo_")
+TRACKING_PARAMS = {
+    "y_source", "gclid", "gbraid", "wbraid", "fbclid", "msclkid", "ttclid",
+    "igshid", "mibextid", "ref", "referrer", "source", "_ga", "_gl", "yclid",
+    "hsa_acc", "hsa_cam", "hsa_grp", "hsa_ad", "hsa_src", "hsa_tgt", "hsa_kw",
+}
+
+
+def strip_tracking_params(url):
+    """Remove analytics/attribution query parameters from a URL.
+
+    Places returns business URLs with the tracking tags the owner configured on
+    their Google listing (utm_source=gmb, y_source=..., and similar). They are
+    noise in a prospect list and break deduplication - two rows for one site.
+    Non-tracking parameters are preserved, since some sites genuinely need
+    them to render."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return url
+    if not parsed.query:
+        return url
+    kept = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+             if k.lower() not in TRACKING_PARAMS
+             and not k.lower().startswith(TRACKING_PARAM_PREFIXES)]
+    return parsed._replace(query=urlencode(kept)).geturl()
+
+
 def load_places_cache():
     return load_json_cache(PLACES_CACHE_FILE, "Places")
 
@@ -2510,6 +2592,7 @@ def lookup_website(name, address, cache):
     try:
         places = (resp.json() or {}).get("places") or []
         website = (places[0].get("websiteUri", "") if places else "").strip()
+        website = strip_tracking_params(website)
         if not website:
             error = "no website listed for this business"
     except (ValueError, AttributeError, IndexError, TypeError) as exc:
@@ -2718,6 +2801,9 @@ def _screen_site(url, want_psi, timeout):
     }
     try:
         issues = detect_issues(crawl_data, {}, {}, include_site_level=False)
+        # Page-level and a genuine High finding: a prospect on plain http has a
+        # "Not Secure" badge on every visitor's browser.
+        issues.extend(check_insecure_scheme(final_url))
         apply_platform_advice(issues, platform)
     except Exception as exc:  # noqa: BLE001
         result["error"] = f"detection failed: {exc}"
@@ -2761,6 +2847,10 @@ def cmd_screen(args):
                 if not urlparse(website).scheme:
                     website = f"https://{website}"
                     result["website"] = website
+                # Also strip on the way in, so lists resolved before this
+                # existed are cleaned without paying for another lookup.
+                website = strip_tracking_params(website)
+                result["website"] = website
                 parsed = urlparse(website)
                 if parsed.scheme not in ("http", "https"):
                     result["error"] = f"unsupported URL scheme: {parsed.scheme or website}"
