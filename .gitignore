@@ -20,6 +20,8 @@ places_cache.json
 # ...except the delivered v3 report, which is the regression baseline every
 # verification diffs against (and the only artifact of real delivered work)
 !rvivl_audit_report_v3.pdf
+# ...and the public sample, generated against the author's own site
+!docs/sample_report.pdf
 
 # Run logs
 crawl_log.txt
