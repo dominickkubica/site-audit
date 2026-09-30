@@ -14,8 +14,8 @@ a business's website, finds what's costing them customers, and turns it into a c
 PDF report. Handing an owner a report about *their* site starts a very different conversation than a
 generic pitch.
 
-It has two modes: **report** for a deep audit of one site, and **screen** for triaging hundreds of
-prospects to decide who to contact first.
+It has two modes: **report** for a deep audit of one site, and **screen** for triaging a whole
+prospect list to decide who to contact first.
 
 <p align="center">
   <img src="docs/sample_report_preview.png" alt="Pages from a sample audit report" width="100%">
